@@ -1,9 +1,6 @@
 # daily2.py
-import os
 import random
 import csv
-import argparse
-
 import pandas as pd
 import streamlit as st
 
@@ -22,21 +19,6 @@ MODEL_TEXT_COLS = [
 
 RATING_PREFIX = "confidence_rating_"
 NOTE_PREFIX = "rating_note_"
-DEFAULT_CSV = "merged_dialogues.csv"
-
-# =========================
-# CLI ARGS
-# =========================
-def get_cli_args():
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--csv", default=DEFAULT_CSV, help="Path to input CSV")
-    parser.add_argument("--rater", default="", help="Annotator name/id (shown, not saved)")
-    args, _ = parser.parse_known_args()
-    return args
-
-ARGS = get_cli_args()
-CSV_PATH = ARGS.csv
-RATER_NAME = ARGS.rater
 
 # =========================
 # Helpers
@@ -54,26 +36,42 @@ def slugify_col(col_name: str) -> str:
     return s.strip("_")
 
 # =========================
-# ROBUST CSV READER
+# ROBUST CSV READER (for uploaded files)
 # =========================
-def robust_read_csv(path_or_file):
+def robust_read_csv(file_like):
+    """
+    Reads uploaded CSV with unknown delimiter.
+    Returns (df, sep_used)
+    """
     for sep in [",", ";", "\t", "|"]:
         try:
+            try:
+                file_like.seek(0)
+            except Exception:
+                pass
+
             df = pd.read_csv(
-                path_or_file,
+                file_like,
                 sep=sep,
                 engine="python",
                 quoting=csv.QUOTE_MINIMAL,
             )
+            # if everything collapsed into one column, try next sep
             if len(df.columns) == 1 and sep != "|":
                 continue
             return df, sep
         except Exception:
+            continue
+
+    # last resort
+    try:
+        try:
+            file_like.seek(0)
+        except Exception:
             pass
 
-    try:
         df = pd.read_csv(
-            path_or_file,
+            file_like,
             sep=",",
             engine="python",
             on_bad_lines="skip",
@@ -94,6 +92,7 @@ def ensure_model_columns_exist(df: pd.DataFrame):
         )
         st.stop()
 
+    # add rating + note columns per model
     for c in MODEL_TEXT_COLS:
         suf = slugify_col(c)
         rating_col = f"{RATING_PREFIX}{suf}"
@@ -104,31 +103,11 @@ def ensure_model_columns_exist(df: pd.DataFrame):
             df[note_col] = ""
     return df
 
-def resolve_csv_path(csv_path: str) -> str:
-    if not csv_path:
-        csv_path = DEFAULT_CSV
-    if not os.path.exists(csv_path) and os.path.exists(DEFAULT_CSV):
-        csv_path = DEFAULT_CSV
-    return csv_path
-
-def load_data(csv_path: str):
-    csv_path = resolve_csv_path(csv_path)
-
-    if not os.path.exists(csv_path):
-        st.error(
-            "CSV file not found.\n\n"
-            f"Tried: {csv_path}\n"
-            f"Also checked: {DEFAULT_CSV}\n\n"
-            "Fix: ensure merged_dialogues.csv is in the repo root, "
-            "or pass --csv with a valid path when running locally."
-        )
-        st.stop()
-
-    df, sep = robust_read_csv(csv_path)
-    df = ensure_model_columns_exist(df)
-    return df, sep, f"Path: {csv_path}", csv_path
-
 def build_items(df: pd.DataFrame):
+    """
+    Build ONE mixed pool of items from ALL model columns.
+    Each item: row_id, model_col, text
+    """
     items = []
     for model_col in MODEL_TEXT_COLS:
         for row_id, val in df[model_col].items():
@@ -142,7 +121,7 @@ def build_items(df: pd.DataFrame):
 
     return items
 
-def init_state(n_items: int):
+def init_order_if_needed(n_items: int):
     if "order" not in st.session_state or len(st.session_state.order) != n_items:
         st.session_state.order = list(range(n_items))
         random.shuffle(st.session_state.order)
@@ -161,37 +140,41 @@ def write_rating_to_df(df: pd.DataFrame, row_id: int, model_col: str, rating: st
     df.at[row_id, rating_col] = clean_cell(rating)
     df.at[row_id, note_col] = clean_cell(note)
 
-def persist_df_to_disk(df: pd.DataFrame, writeback_path: str, sep_used: str) -> bool:
-    if not writeback_path:
-        return False
-
-    try:
-        backup_path = writeback_path + ".bak"
-        try:
-            if os.path.exists(writeback_path):
-                with open(writeback_path, "rb") as src, open(backup_path, "wb") as dst:
-                    dst.write(src.read())
-        except Exception:
-            pass
-
-        df.to_csv(writeback_path, index=False, sep=sep_used, quoting=csv.QUOTE_MINIMAL)
-        return True
-    except Exception as e:
-        st.error(f"Could not save back to CSV: {e}")
-        return False
-
 # =========================
-# LOAD + PREPARE
+# SIDEBAR: Upload + Rater
 # =========================
-df, sep_used, source_label, writeback_path = load_data(CSV_PATH)
+st.sidebar.title("Setup")
+
+rater_name = st.sidebar.text_input("Rater name (required)", value="")
+uploaded_file = st.sidebar.file_uploader("Upload your CSV", type=["csv"])
+
+if not rater_name.strip():
+    st.info("Enter your name in the sidebar to start.")
+    st.stop()
+
+if uploaded_file is None:
+    st.info("Upload your CSV in the sidebar to start.")
+    st.stop()
+
+# Read CSV
+df, sep_used = robust_read_csv(uploaded_file)
+df = ensure_model_columns_exist(df)
+
+source_label = f"Uploaded: {uploaded_file.name}"
 items = build_items(df)
 
-init_state(len(items))
+# Reset order when a NEW file is uploaded
+file_signature = f"{uploaded_file.name}-{uploaded_file.size}"
+if st.session_state.get("file_signature") != file_signature:
+    st.session_state.file_signature = file_signature
+    st.session_state.order = list(range(len(items)))
+    random.shuffle(st.session_state.order)
+    st.session_state.pos = 0
+
+init_order_if_needed(len(items))
 clamp_pos(len(items))
 
-# =========================
-# SIDEBAR
-# =========================
+# Optional reshuffle
 st.sidebar.subheader("Controls")
 if st.sidebar.button("Reshuffle order"):
     st.session_state.order = list(range(len(items)))
@@ -203,11 +186,7 @@ if st.sidebar.button("Reshuffle order"):
 # MAIN UI
 # =========================
 st.title("Culture Rater")
-
-caption_bits = [source_label, f"Items: {len(items)}"]
-if RATER_NAME:
-    caption_bits.append(f"Rater: {RATER_NAME} (not saved)")
-st.caption(" • ".join(caption_bits))
+st.caption(" • ".join([source_label, f"Items: {len(items)}", f"Rater: {rater_name}"]))
 
 with st.expander("A/B/C/D meaning (confidence it is my country)", expanded=True):
     st.markdown("- **A** — Very sure: Unmistakably my country’s culture.")
@@ -238,19 +217,15 @@ st.markdown(
 )
 st.markdown("---")
 
-# ==============
-# Per-item state keys
-# ==============
+# Per-item keys (unique per row+model)
 note_key = f"note_{row_id}_{suf}"
 sel_key = f"selected_rating_{row_id}_{suf}"
 
-# init note state
+# init per-item state from saved columns
 if note_key not in st.session_state:
     st.session_state[note_key] = existing_note
-
-# init selected rating state (NOT auto-save)
 if sel_key not in st.session_state:
-    st.session_state[sel_key] = existing_rating  # could be "" if none
+    st.session_state[sel_key] = existing_rating  # could be ""
 
 st.text_area("Note (optional)", key=note_key, height=90)
 
@@ -258,24 +233,22 @@ st.text_area("Note (optional)", key=note_key, height=90)
 # SELECT rating (does NOT move)
 # =========================
 st.subheader("Select rating (A–D)")
-selected = st.radio(
+st.radio(
     "Choose one:",
     options=["", "A", "B", "C", "D"],
     format_func=lambda x: "— (not selected)" if x == "" else x,
     key=sel_key,
     horizontal=True,
 )
-
-st.caption(f"Current selection (not saved yet): **{selected or '-'}**")
+st.caption(f"Current selection (not saved yet): **{st.session_state[sel_key] or '-'}**")
 
 # =========================
-# NAV (Save on Next)
+# NAV (Save on Next only)
 # =========================
 nav_cols = st.columns(2)
 
 with nav_cols[0]:
     if st.button("Prev", use_container_width=True):
-        # do NOT save on Prev (by your request)
         st.session_state.pos -= 1
         clamp_pos(len(items))
         st.rerun()
@@ -286,21 +259,27 @@ with nav_cols[1]:
             st.warning("Please select A/B/C/D before going to next.")
             st.stop()
 
-        # Save selection + note
-        write_rating_to_df(df, row_id, model_col, st.session_state[sel_key], st.session_state[note_key])
-        persist_df_to_disk(df, writeback_path, sep_used)
+        # Save selection + note INTO THE DF (for export)
+        write_rating_to_df(
+            df,
+            row_id,
+            model_col,
+            st.session_state[sel_key],
+            st.session_state[note_key],
+        )
 
-        # Move next
         if st.session_state.pos < len(items) - 1:
             st.session_state.pos += 1
         clamp_pos(len(items))
         st.rerun()
 
 # =========================
-# EXPORT
+# EXPORT (per-annotator)
 # =========================
 st.subheader("Export updated CSV")
-export_name = st.text_input("Download filename", value="merged_dialogues_with_ratings.csv")
+
+default_name = f"{uploaded_file.name.replace('.csv','')}_rated_{rater_name.strip().replace(' ','_')}.csv"
+export_name = st.text_input("Download filename", value=default_name)
 
 csv_bytes = df.to_csv(index=False, sep=sep_used, quoting=csv.QUOTE_MINIMAL).encode("utf-8")
 st.download_button(
@@ -310,8 +289,4 @@ st.download_button(
     mime="text/csv",
 )
 
-st.caption(
-    "Note: Streamlit Cloud storage is temporary. "
-    "Use the Download button to collect ratings reliably."
-)
-st.caption(f"Write-back attempted to: {writeback_path} (backup: {writeback_path}.bak)")
+st.info("Important: Always download the updated CSV at the end and send it back to Neda.")
