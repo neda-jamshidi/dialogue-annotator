@@ -36,13 +36,9 @@ def slugify_col(col_name: str) -> str:
     return s.strip("_")
 
 # =========================
-# ROBUST CSV READER (for uploaded files)
+# ROBUST CSV READER (uploaded)
 # =========================
 def robust_read_csv(file_like):
-    """
-    Reads uploaded CSV with unknown delimiter.
-    Returns (df, sep_used)
-    """
     for sep in [",", ";", "\t", "|"]:
         try:
             try:
@@ -56,14 +52,12 @@ def robust_read_csv(file_like):
                 engine="python",
                 quoting=csv.QUOTE_MINIMAL,
             )
-            # if everything collapsed into one column, try next sep
             if len(df.columns) == 1 and sep != "|":
                 continue
             return df, sep
         except Exception:
             continue
 
-    # last resort
     try:
         try:
             file_like.seek(0)
@@ -92,7 +86,6 @@ def ensure_model_columns_exist(df: pd.DataFrame):
         )
         st.stop()
 
-    # add rating + note columns per model
     for c in MODEL_TEXT_COLS:
         suf = slugify_col(c)
         rating_col = f"{RATING_PREFIX}{suf}"
@@ -104,34 +97,16 @@ def ensure_model_columns_exist(df: pd.DataFrame):
     return df
 
 def build_items(df: pd.DataFrame):
-    """
-    Build ONE mixed pool of items from ALL model columns.
-    Each item: row_id, model_col, text
-    """
     items = []
     for model_col in MODEL_TEXT_COLS:
         for row_id, val in df[model_col].items():
             t = clean_cell(val)
             if t:
                 items.append({"row_id": row_id, "model_col": model_col, "text": t})
-
     if not items:
         st.error("No non-empty dialogs found across the specified model columns.")
         st.stop()
-
     return items
-
-def init_order_if_needed(n_items: int):
-    if "order" not in st.session_state or len(st.session_state.order) != n_items:
-        st.session_state.order = list(range(n_items))
-        random.shuffle(st.session_state.order)
-        st.session_state.pos = 0
-
-def clamp_pos(n_items: int):
-    st.session_state.pos = max(0, min(st.session_state.pos, n_items - 1))
-
-def current_item_index():
-    return st.session_state.order[st.session_state.pos]
 
 def write_rating_to_df(df: pd.DataFrame, row_id: int, model_col: str, rating: str, note: str):
     suf = slugify_col(model_col)
@@ -140,8 +115,11 @@ def write_rating_to_df(df: pd.DataFrame, row_id: int, model_col: str, rating: st
     df.at[row_id, rating_col] = clean_cell(rating)
     df.at[row_id, note_col] = clean_cell(note)
 
+def clamp_pos(n_items: int):
+    st.session_state.pos = max(0, min(st.session_state.pos, n_items - 1))
+
 # =========================
-# SIDEBAR: Upload + Rater
+# SIDEBAR: Setup
 # =========================
 st.sidebar.title("Setup")
 
@@ -156,25 +134,36 @@ if uploaded_file is None:
     st.info("Upload your CSV in the sidebar to start.")
     st.stop()
 
-# Read CSV
-df, sep_used = robust_read_csv(uploaded_file)
-df = ensure_model_columns_exist(df)
-
-source_label = f"Uploaded: {uploaded_file.name}"
-items = build_items(df)
-
-# Reset order when a NEW file is uploaded
+# =========================
+# LOAD ONCE PER FILE (store df in session_state)
+# =========================
 file_signature = f"{uploaded_file.name}-{uploaded_file.size}"
+
 if st.session_state.get("file_signature") != file_signature:
+    # new file uploaded -> reset everything
+    df0, sep0 = robust_read_csv(uploaded_file)
+    df0 = ensure_model_columns_exist(df0)
+
     st.session_state.file_signature = file_signature
-    st.session_state.order = list(range(len(items)))
+    st.session_state.source_label = f"Uploaded: {uploaded_file.name}"
+    st.session_state.sep_used = sep0
+    st.session_state.df = df0
+
+    # build items once per file
+    st.session_state.items = build_items(st.session_state.df)
+
+    # shuffle order once per file
+    st.session_state.order = list(range(len(st.session_state.items)))
     random.shuffle(st.session_state.order)
     st.session_state.pos = 0
 
-init_order_if_needed(len(items))
-clamp_pos(len(items))
+# always read from session_state (NOT from uploaded_file again)
+df = st.session_state.df
+sep_used = st.session_state.sep_used
+source_label = st.session_state.source_label
+items = st.session_state.items
 
-# Optional reshuffle
+# Sidebar controls
 st.sidebar.subheader("Controls")
 if st.sidebar.button("Reshuffle order"):
     st.session_state.order = list(range(len(items)))
@@ -194,8 +183,14 @@ with st.expander("A/B/C/D meaning (confidence it is my country)", expanded=True)
     st.markdown("- **C** — Not sure: Could be many countries; weak or generic cultural cues.")
     st.markdown("- **D** — Sure it is NOT mine: Clearly mismatched; points elsewhere or feels wrong.")
 
-idx_in_items = current_item_index()
+# current item
+if "pos" not in st.session_state:
+    st.session_state.pos = 0
+clamp_pos(len(items))
+
+idx_in_items = st.session_state.order[st.session_state.pos]
 item = items[idx_in_items]
+
 row_id = item["row_id"]
 model_col = item["model_col"]
 text = item["text"]
@@ -204,6 +199,7 @@ suf = slugify_col(model_col)
 rating_col = f"{RATING_PREFIX}{suf}"
 note_col = f"{NOTE_PREFIX}{suf}"
 
+# Read saved values from df (this now persists!)
 existing_note = clean_cell(df.at[row_id, note_col])
 existing_rating = clean_cell(df.at[row_id, rating_col])
 
@@ -217,21 +213,19 @@ st.markdown(
 )
 st.markdown("---")
 
-# Per-item keys (unique per row+model)
+# Per-item widget keys
 note_key = f"note_{row_id}_{suf}"
 sel_key = f"selected_rating_{row_id}_{suf}"
 
-# init per-item state from saved columns
+# IMPORTANT: Don't overwrite user typing on reruns.
+# Only initialize if key doesn't exist.
 if note_key not in st.session_state:
     st.session_state[note_key] = existing_note
 if sel_key not in st.session_state:
-    st.session_state[sel_key] = existing_rating  # could be ""
+    st.session_state[sel_key] = existing_rating  # "" / A/B/C/D
 
 st.text_area("Note (optional)", key=note_key, height=90)
 
-# =========================
-# SELECT rating (does NOT move)
-# =========================
 st.subheader("Select rating (A–D)")
 st.radio(
     "Choose one:",
@@ -259,9 +253,9 @@ with nav_cols[1]:
             st.warning("Please select A/B/C/D before going to next.")
             st.stop()
 
-        # Save selection + note INTO THE DF (for export)
+        # Save into persistent df in session_state
         write_rating_to_df(
-            df,
+            st.session_state.df,
             row_id,
             model_col,
             st.session_state[sel_key],
@@ -274,14 +268,13 @@ with nav_cols[1]:
         st.rerun()
 
 # =========================
-# EXPORT (per-annotator)
+# EXPORT
 # =========================
 st.subheader("Export updated CSV")
-
 default_name = f"{uploaded_file.name.replace('.csv','')}_rated_{rater_name.strip().replace(' ','_')}.csv"
 export_name = st.text_input("Download filename", value=default_name)
 
-csv_bytes = df.to_csv(index=False, sep=sep_used, quoting=csv.QUOTE_MINIMAL).encode("utf-8")
+csv_bytes = st.session_state.df.to_csv(index=False, sep=sep_used, quoting=csv.QUOTE_MINIMAL).encode("utf-8")
 st.download_button(
     label="Download updated CSV",
     data=csv_bytes,
@@ -289,4 +282,4 @@ st.download_button(
     mime="text/csv",
 )
 
-st.info("Important: Always download the updated CSV at the end and send it back to Neda.")
+st.info("Tip: your ratings are saved in this session. At the end, download the updated CSV and send it back to Neda.")
