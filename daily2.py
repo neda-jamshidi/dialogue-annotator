@@ -19,16 +19,12 @@ MODEL_TEXT_COLS = [
     "Mistral Large",
 ]
 
-RATING_PREFIX = "confidence_rating_"   # e.g., confidence_rating_Chatgpt_5_2
-NOTE_PREFIX = "rating_note_"           # e.g., rating_note_Chatgpt_5_2
-
-DEFAULT_CSV = "merged_dialogues.csv"   # for Streamlit Cloud
+RATING_PREFIX = "confidence_rating_"
+NOTE_PREFIX = "rating_note_"
+DEFAULT_CSV = "merged_dialogues.csv"
 
 # =========================
 # CLI ARGS
-# - Streamlit Cloud does NOT pass CLI args -> must have defaults
-# - Local run still supported:
-#     streamlit run daily2.py -- --csv "/path/to/merged_dialogues.csv" --rater "Neda"
 # =========================
 def get_cli_args():
     parser = argparse.ArgumentParser(add_help=False)
@@ -45,14 +41,12 @@ RATER_NAME = ARGS.rater
 # Helpers
 # =========================
 def clean_cell(x) -> str:
-    """Return empty string for NaN/None/'nan', else stripped string."""
     if pd.isna(x):
         return ""
     s = str(x).strip()
     return "" if s.lower() == "nan" else s
 
 def slugify_col(col_name: str) -> str:
-    """Make a safe suffix for column names."""
     s = "".join(ch if ch.isalnum() else "_" for ch in col_name.strip())
     while "__" in s:
         s = s.replace("__", "_")
@@ -70,14 +64,12 @@ def robust_read_csv(path_or_file):
                 engine="python",
                 quoting=csv.QUOTE_MINIMAL,
             )
-            # if it collapsed everything into 1 column, try next sep
             if len(df.columns) == 1 and sep != "|":
                 continue
             return df, sep
         except Exception:
             pass
 
-    # last resort
     try:
         df = pd.read_csv(
             path_or_file,
@@ -92,7 +84,6 @@ def robust_read_csv(path_or_file):
         st.stop()
 
 def ensure_model_columns_exist(df: pd.DataFrame):
-    # check model text columns exist
     missing = [c for c in MODEL_TEXT_COLS if c not in df.columns]
     if missing:
         st.error(
@@ -102,7 +93,6 @@ def ensure_model_columns_exist(df: pd.DataFrame):
         )
         st.stop()
 
-    # add rating + note columns per model
     for c in MODEL_TEXT_COLS:
         suf = slugify_col(c)
         rating_col = f"{RATING_PREFIX}{suf}"
@@ -114,18 +104,10 @@ def ensure_model_columns_exist(df: pd.DataFrame):
     return df
 
 def resolve_csv_path(csv_path: str) -> str:
-    """
-    Streamlit Cloud runs your repo under /mount/src/<repo>/.
-    Users might pass a local path that doesn't exist on Cloud.
-    So we fall back to DEFAULT_CSV if present.
-    """
     if not csv_path:
         csv_path = DEFAULT_CSV
-
-    # if user provided a non-existent path, fall back to repo file
     if not os.path.exists(csv_path) and os.path.exists(DEFAULT_CSV):
         csv_path = DEFAULT_CSV
-
     return csv_path
 
 def load_data(csv_path: str):
@@ -146,10 +128,6 @@ def load_data(csv_path: str):
     return df, sep, f"Path: {csv_path}", csv_path
 
 def build_items(df: pd.DataFrame):
-    """
-    Build ONE mixed pool of items from ALL model columns.
-    Each item knows: row_id, model_col, text
-    """
     items = []
     for model_col in MODEL_TEXT_COLS:
         for row_id, val in df[model_col].items():
@@ -164,7 +142,6 @@ def build_items(df: pd.DataFrame):
     return items
 
 def init_state(n_items: int):
-    # shuffle ONCE per session; stable across reruns
     if "order" not in st.session_state or len(st.session_state.order) != n_items:
         st.session_state.order = list(range(n_items))
         random.shuffle(st.session_state.order)
@@ -184,16 +161,10 @@ def write_rating_to_df(df: pd.DataFrame, row_id: int, model_col: str, rating: st
     df.at[row_id, note_col] = clean_cell(note)
 
 def persist_df_to_disk(df: pd.DataFrame, writeback_path: str, sep_used: str) -> bool:
-    """
-    NOTE: On Streamlit Cloud, filesystem is ephemeral.
-    This may work during a session but is NOT a reliable long-term storage.
-    Annotators should use the Download button.
-    """
     if not writeback_path:
         return False
 
     try:
-        # backup original first
         backup_path = writeback_path + ".bak"
         try:
             if os.path.exists(writeback_path):
@@ -218,7 +189,7 @@ init_state(len(items))
 clamp_pos(len(items))
 
 # =========================
-# SIDEBAR (only reshuffle)
+# SIDEBAR
 # =========================
 st.sidebar.subheader("Controls")
 if st.sidebar.button("Reshuffle order"):
@@ -257,7 +228,7 @@ existing_note = clean_cell(df.at[row_id, note_col])
 existing_rating = clean_cell(df.at[row_id, rating_col])
 
 st.write(f"Item {st.session_state.pos + 1} / {len(items)}")
-st.caption(f"Model column: **{model_col}**  •  Existing rating: **{existing_rating or '-'}**")
+st.caption(f"Model column: **{model_col}**  •  Saved rating: **{existing_rating or '-'}**")
 
 st.markdown("---")
 st.markdown(
@@ -266,43 +237,61 @@ st.markdown(
 )
 st.markdown("---")
 
+# ==============
+# Per-item state keys
+# ==============
 note_key = f"note_{row_id}_{suf}"
+sel_key = f"selected_rating_{row_id}_{suf}"
+
+# init note state
 if note_key not in st.session_state:
     st.session_state[note_key] = existing_note
+
+# init selected rating state (NOT auto-save)
+if sel_key not in st.session_state:
+    st.session_state[sel_key] = existing_rating  # could be "" if none
 
 st.text_area("Note (optional)", key=note_key, height=90)
 
 # =========================
-# ONLY: A/B/C/D + Prev/Next
+# SELECT rating (does NOT move)
 # =========================
-st.subheader("Rate (A–D)")
-btn_cols = st.columns(4)
-rating_clicked = None
-for col, label in zip(btn_cols, ["A", "B", "C", "D"]):
-    with col:
-        if st.button(label, use_container_width=True, key=f"rate_{label}_{row_id}_{suf}_{st.session_state.pos}"):
-            rating_clicked = label
+st.subheader("Select rating (A–D)")
+selected = st.radio(
+    "Choose one:",
+    options=["", "A", "B", "C", "D"],
+    format_func=lambda x: "— (not selected)" if x == "" else x,
+    key=sel_key,
+    horizontal=True,
+)
 
-# Click A/B/C/D -> save immediately + go next
-if rating_clicked:
-    write_rating_to_df(df, row_id, model_col, rating_clicked, st.session_state[note_key])
-    persist_df_to_disk(df, writeback_path, sep_used)
+st.caption(f"Current selection (not saved yet): **{selected or '-'}**")
 
-    if st.session_state.pos < len(items) - 1:
-        st.session_state.pos += 1
-    clamp_pos(len(items))
-    st.rerun()
-
+# =========================
+# NAV (Save on Next)
+# =========================
 nav_cols = st.columns(2)
+
 with nav_cols[0]:
     if st.button("Prev", use_container_width=True):
+        # do NOT save on Prev (by your request)
         st.session_state.pos -= 1
         clamp_pos(len(items))
         st.rerun()
 
 with nav_cols[1]:
-    if st.button("Next", use_container_width=True):
-        st.session_state.pos += 1
+    if st.button("Next (save & go)", use_container_width=True):
+        if not st.session_state[sel_key]:
+            st.warning("Please select A/B/C/D before going to next.")
+            st.stop()
+
+        # Save selection + note
+        write_rating_to_df(df, row_id, model_col, st.session_state[sel_key], st.session_state[note_key])
+        persist_df_to_disk(df, writeback_path, sep_used)
+
+        # Move next
+        if st.session_state.pos < len(items) - 1:
+            st.session_state.pos += 1
         clamp_pos(len(items))
         st.rerun()
 
@@ -325,4 +314,3 @@ st.caption(
     "Use the Download button to collect ratings reliably."
 )
 st.caption(f"Write-back attempted to: {writeback_path} (backup: {writeback_path}.bak)")
-      
