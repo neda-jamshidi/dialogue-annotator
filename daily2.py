@@ -22,15 +22,17 @@ MODEL_TEXT_COLS = [
 RATING_PREFIX = "confidence_rating_"   # e.g., confidence_rating_Chatgpt_5_2
 NOTE_PREFIX = "rating_note_"           # e.g., rating_note_Chatgpt_5_2
 
+DEFAULT_CSV = "merged_dialogues.csv"   # for Streamlit Cloud
+
 # =========================
-# CLI ARGS (reliable for Streamlit)
-# Run:
-#   cd ~/Desktop
-#   streamlit run culture_rater.py -- --csv "/Users/<you>/Desktop/merged_dialogues.csv.csv" --rater "Neda"
+# CLI ARGS
+# - Streamlit Cloud does NOT pass CLI args -> must have defaults
+# - Local run still supported:
+#     streamlit run daily2.py -- --csv "/path/to/merged_dialogues.csv" --rater "Neda"
 # =========================
 def get_cli_args():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--csv", required=True, help="Path to input CSV")
+    parser.add_argument("--csv", default=DEFAULT_CSV, help="Path to input CSV")
     parser.add_argument("--rater", default="", help="Annotator name/id (shown, not saved)")
     args, _ = parser.parse_known_args()
     return args
@@ -68,6 +70,7 @@ def robust_read_csv(path_or_file):
                 engine="python",
                 quoting=csv.QUOTE_MINIMAL,
             )
+            # if it collapsed everything into 1 column, try next sep
             if len(df.columns) == 1 and sep != "|":
                 continue
             return df, sep
@@ -110,13 +113,32 @@ def ensure_model_columns_exist(df: pd.DataFrame):
             df[note_col] = ""
     return df
 
-def load_data(csv_path: str):
+def resolve_csv_path(csv_path: str) -> str:
+    """
+    Streamlit Cloud runs your repo under /mount/src/<repo>/.
+    Users might pass a local path that doesn't exist on Cloud.
+    So we fall back to DEFAULT_CSV if present.
+    """
     if not csv_path:
-        st.error("Missing --csv argument.")
-        st.stop()
+        csv_path = DEFAULT_CSV
+
+    # if user provided a non-existent path, fall back to repo file
+    if not os.path.exists(csv_path) and os.path.exists(DEFAULT_CSV):
+        csv_path = DEFAULT_CSV
+
+    return csv_path
+
+def load_data(csv_path: str):
+    csv_path = resolve_csv_path(csv_path)
 
     if not os.path.exists(csv_path):
-        st.error(f"File not found: {csv_path}")
+        st.error(
+            "CSV file not found.\n\n"
+            f"Tried: {csv_path}\n"
+            f"Also checked: {DEFAULT_CSV}\n\n"
+            "Fix: ensure merged_dialogues.csv is in the repo root, "
+            "or pass --csv with a valid path when running locally."
+        )
         st.stop()
 
     df, sep = robust_read_csv(csv_path)
@@ -162,6 +184,11 @@ def write_rating_to_df(df: pd.DataFrame, row_id: int, model_col: str, rating: st
     df.at[row_id, note_col] = clean_cell(note)
 
 def persist_df_to_disk(df: pd.DataFrame, writeback_path: str, sep_used: str) -> bool:
+    """
+    NOTE: On Streamlit Cloud, filesystem is ephemeral.
+    This may work during a session but is NOT a reliable long-term storage.
+    Annotators should use the Download button.
+    """
     if not writeback_path:
         return False
 
@@ -283,7 +310,7 @@ with nav_cols[1]:
 # EXPORT
 # =========================
 st.subheader("Export updated CSV")
-export_name = st.text_input("Download filename", value="merged_dialogues.csv_with_ratings.csv")
+export_name = st.text_input("Download filename", value="merged_dialogues_with_ratings.csv")
 
 csv_bytes = df.to_csv(index=False, sep=sep_used, quoting=csv.QUOTE_MINIMAL).encode("utf-8")
 st.download_button(
@@ -293,4 +320,9 @@ st.download_button(
     mime="text/csv",
 )
 
-st.caption(f"Write-back is ON: {writeback_path} (backup: {writeback_path}.bak)")
+st.caption(
+    "Note: Streamlit Cloud storage is temporary. "
+    "Use the Download button to collect ratings reliably."
+)
+st.caption(f"Write-back attempted to: {writeback_path} (backup: {writeback_path}.bak)")
+      
