@@ -6,9 +6,6 @@ import streamlit as st
 
 st.set_page_config(page_title="Culture Rater", layout="centered")
 
-# =========================
-# CONFIG
-# =========================
 MODEL_TEXT_COLS = [
     "Chatgpt 5.2",
     "Gemini Pro",
@@ -20,9 +17,6 @@ MODEL_TEXT_COLS = [
 RATING_PREFIX = "confidence_rating_"
 NOTE_PREFIX = "rating_note_"
 
-# =========================
-# Helpers
-# =========================
 def clean_cell(x) -> str:
     if pd.isna(x):
         return ""
@@ -35,9 +29,6 @@ def slugify_col(col_name: str) -> str:
         s = s.replace("__", "_")
     return s.strip("_")
 
-# =========================
-# ROBUST CSV READER (uploaded)
-# =========================
 def robust_read_csv(file_like):
     for sep in [",", ";", "\t", "|"]:
         try:
@@ -96,17 +87,17 @@ def ensure_model_columns_exist(df: pd.DataFrame):
             df[note_col] = ""
     return df
 
-def build_items(df: pd.DataFrame):
-    items = []
+def build_item_pool(df: pd.DataFrame):
+    pool = []
     for model_col in MODEL_TEXT_COLS:
         for row_id, val in df[model_col].items():
             t = clean_cell(val)
             if t:
-                items.append({"row_id": row_id, "model_col": model_col, "text": t})
-    if not items:
+                pool.append({"row_id": row_id, "model_col": model_col, "text": t})
+    if not pool:
         st.error("No non-empty dialogs found across the specified model columns.")
         st.stop()
-    return items
+    return pool
 
 def write_rating_to_df(df: pd.DataFrame, row_id: int, model_col: str, rating: str, note: str):
     suf = slugify_col(model_col)
@@ -119,10 +110,9 @@ def clamp_pos(n_items: int):
     st.session_state.pos = max(0, min(st.session_state.pos, n_items - 1))
 
 # =========================
-# SIDEBAR: Setup
+# SIDEBAR
 # =========================
 st.sidebar.title("Setup")
-
 rater_name = st.sidebar.text_input("Rater name (required)", value="")
 uploaded_file = st.sidebar.file_uploader("Upload your CSV", type=["csv"])
 
@@ -135,12 +125,11 @@ if uploaded_file is None:
     st.stop()
 
 # =========================
-# LOAD ONCE PER FILE (store df in session_state)
+# LOAD ONCE PER FILE (persist df + pool)
 # =========================
 file_signature = f"{uploaded_file.name}-{uploaded_file.size}"
 
 if st.session_state.get("file_signature") != file_signature:
-    # new file uploaded -> reset everything
     df0, sep0 = robust_read_csv(uploaded_file)
     df0 = ensure_model_columns_exist(df0)
 
@@ -149,24 +138,21 @@ if st.session_state.get("file_signature") != file_signature:
     st.session_state.sep_used = sep0
     st.session_state.df = df0
 
-    # build items once per file
-    st.session_state.items = build_items(st.session_state.df)
+    st.session_state.item_pool = build_item_pool(st.session_state.df)
 
-    # shuffle order once per file
-    st.session_state.order = list(range(len(st.session_state.items)))
+    st.session_state.order = list(range(len(st.session_state.item_pool)))
     random.shuffle(st.session_state.order)
     st.session_state.pos = 0
 
-# always read from session_state (NOT from uploaded_file again)
 df = st.session_state.df
 sep_used = st.session_state.sep_used
 source_label = st.session_state.source_label
-items = st.session_state.items
+item_pool = st.session_state.item_pool
 
 # Sidebar controls
 st.sidebar.subheader("Controls")
 if st.sidebar.button("Reshuffle order"):
-    st.session_state.order = list(range(len(items)))
+    st.session_state.order = list(range(len(item_pool)))
     random.shuffle(st.session_state.order)
     st.session_state.pos = 0
     st.rerun()
@@ -175,7 +161,7 @@ if st.sidebar.button("Reshuffle order"):
 # MAIN UI
 # =========================
 st.title("Culture Rater")
-st.caption(" • ".join([source_label, f"Items: {len(items)}", f"Rater: {rater_name}"]))
+st.caption(" • ".join([source_label, f"Items: {len(item_pool)}", f"Rater: {rater_name}"]))
 
 with st.expander("A/B/C/D meaning (confidence it is my country)", expanded=True):
     st.markdown("- **A** — Very sure: Unmistakably my country’s culture.")
@@ -183,13 +169,12 @@ with st.expander("A/B/C/D meaning (confidence it is my country)", expanded=True)
     st.markdown("- **C** — Not sure: Could be many countries; weak or generic cultural cues.")
     st.markdown("- **D** — Sure it is NOT mine: Clearly mismatched; points elsewhere or feels wrong.")
 
-# current item
 if "pos" not in st.session_state:
     st.session_state.pos = 0
-clamp_pos(len(items))
+clamp_pos(len(item_pool))
 
-idx_in_items = st.session_state.order[st.session_state.pos]
-item = items[idx_in_items]
+idx_in_pool = st.session_state.order[st.session_state.pos]
+item = item_pool[idx_in_pool]
 
 row_id = item["row_id"]
 model_col = item["model_col"]
@@ -199,11 +184,10 @@ suf = slugify_col(model_col)
 rating_col = f"{RATING_PREFIX}{suf}"
 note_col = f"{NOTE_PREFIX}{suf}"
 
-# Read saved values from df (this now persists!)
 existing_note = clean_cell(df.at[row_id, note_col])
 existing_rating = clean_cell(df.at[row_id, rating_col])
 
-st.write(f"Item {st.session_state.pos + 1} / {len(items)}")
+st.write(f"Item {st.session_state.pos + 1} / {len(item_pool)}")
 st.caption(f"Model column: **{model_col}**  •  Saved rating: **{existing_rating or '-'}**")
 
 st.markdown("---")
@@ -213,16 +197,14 @@ st.markdown(
 )
 st.markdown("---")
 
-# Per-item widget keys
 note_key = f"note_{row_id}_{suf}"
 sel_key = f"selected_rating_{row_id}_{suf}"
 
-# IMPORTANT: Don't overwrite user typing on reruns.
-# Only initialize if key doesn't exist.
+# init widgets once
 if note_key not in st.session_state:
     st.session_state[note_key] = existing_note
 if sel_key not in st.session_state:
-    st.session_state[sel_key] = existing_rating  # "" / A/B/C/D
+    st.session_state[sel_key] = existing_rating
 
 st.text_area("Note (optional)", key=note_key, height=90)
 
@@ -237,14 +219,14 @@ st.radio(
 st.caption(f"Current selection (not saved yet): **{st.session_state[sel_key] or '-'}**")
 
 # =========================
-# NAV (Save on Next only)
+# NAV
 # =========================
 nav_cols = st.columns(2)
 
 with nav_cols[0]:
     if st.button("Prev", use_container_width=True):
         st.session_state.pos -= 1
-        clamp_pos(len(items))
+        clamp_pos(len(item_pool))
         st.rerun()
 
 with nav_cols[1]:
@@ -253,7 +235,6 @@ with nav_cols[1]:
             st.warning("Please select A/B/C/D before going to next.")
             st.stop()
 
-        # Save into persistent df in session_state
         write_rating_to_df(
             st.session_state.df,
             row_id,
@@ -262,9 +243,9 @@ with nav_cols[1]:
             st.session_state[note_key],
         )
 
-        if st.session_state.pos < len(items) - 1:
+        if st.session_state.pos < len(item_pool) - 1:
             st.session_state.pos += 1
-        clamp_pos(len(items))
+        clamp_pos(len(item_pool))
         st.rerun()
 
 # =========================
@@ -282,4 +263,4 @@ st.download_button(
     mime="text/csv",
 )
 
-st.info("Tip: your ratings are saved in this session. At the end, download the updated CSV and send it back to Neda.")
+st.info("Tip: At the end, download the updated CSV and send it back to Neda.")
