@@ -1,19 +1,6 @@
-# daily2.py — ORDERED BATCHES (40 items each) + SHUFFLE INSIDE EACH BATCH
-# Keeps your original UI (A/B/C/D explanation, Prev/Next(save&go), Export)
-#
-# How to open batch 1/2/3...
-#   https://YOURAPP.streamlit.app/?batch=1
-#   https://YOURAPP.streamlit.app/?batch=2
-#   ...
-#
-# Notes:
-# - Batch assignment is deterministic (by pool order): first 40 items = batch 1, next 40 = batch 2, etc.
-# - Display order is randomized ONLY inside the chosen batch (stable until you press "Reshuffle order").
-# - Export downloads ONLY the rows that appear in THIS batch (all columns preserved, subset of rows).
-
+# daily2.py
 import random
 import csv
-import math
 import pandas as pd
 import streamlit as st
 
@@ -29,25 +16,18 @@ MODEL_TEXT_COLS = [
 
 RATING_PREFIX = "confidence_rating_"
 NOTE_PREFIX = "rating_note_"
-BATCH_SIZE = 40  # fixed as you requested
 
-
-# =========================
-# Helpers
-# =========================
 def clean_cell(x) -> str:
     if pd.isna(x):
         return ""
     s = str(x).strip()
     return "" if s.lower() == "nan" else s
 
-
 def slugify_col(col_name: str) -> str:
     s = "".join(ch if ch.isalnum() else "_" for ch in col_name.strip())
     while "__" in s:
         s = s.replace("__", "_")
     return s.strip("_")
-
 
 def robust_read_csv(file_like):
     for sep in [",", ";", "\t", "|"]:
@@ -87,7 +67,6 @@ def robust_read_csv(file_like):
         st.error(f"Could not read CSV.\n\nError: {e}")
         st.stop()
 
-
 def ensure_model_columns_exist(df: pd.DataFrame):
     missing = [c for c in MODEL_TEXT_COLS if c not in df.columns]
     if missing:
@@ -108,24 +87,17 @@ def ensure_model_columns_exist(df: pd.DataFrame):
             df[note_col] = ""
     return df
 
-
 def build_item_pool(df: pd.DataFrame):
-    """
-    Deterministic order:
-      MODEL_TEXT_COLS order, then row order (top-to-bottom).
-    So batch 1 = first 40 items in THIS fixed order.
-    """
     pool = []
     for model_col in MODEL_TEXT_COLS:
         for row_id, val in df[model_col].items():
             t = clean_cell(val)
             if t:
-                pool.append({"row_id": int(row_id), "model_col": model_col, "text": t})
+                pool.append({"row_id": row_id, "model_col": model_col, "text": t})
     if not pool:
         st.error("No non-empty dialogs found across the specified model columns.")
         st.stop()
     return pool
-
 
 def write_rating_to_df(df: pd.DataFrame, row_id: int, model_col: str, rating: str, note: str):
     suf = slugify_col(model_col)
@@ -134,20 +106,8 @@ def write_rating_to_df(df: pd.DataFrame, row_id: int, model_col: str, rating: st
     df.at[row_id, rating_col] = clean_cell(rating)
     df.at[row_id, note_col] = clean_cell(note)
 
-
 def clamp_pos(n_items: int):
-    st.session_state.pos = max(0, min(st.session_state.pos, max(0, n_items - 1)))
-
-
-def get_query_int(key: str, default: int) -> int:
-    try:
-        v = st.query_params.get(key, str(default))
-        if isinstance(v, list):
-            v = v[0] if v else str(default)
-        return int(str(v).strip())
-    except Exception:
-        return default
-
+    st.session_state.pos = max(0, min(st.session_state.pos, n_items - 1))
 
 # =========================
 # SIDEBAR
@@ -165,7 +125,7 @@ if uploaded_file is None:
     st.stop()
 
 # =========================
-# LOAD ONCE PER FILE
+# LOAD ONCE PER FILE (persist df + pool)
 # =========================
 file_signature = f"{uploaded_file.name}-{uploaded_file.size}"
 
@@ -178,47 +138,21 @@ if st.session_state.get("file_signature") != file_signature:
     st.session_state.sep_used = sep0
     st.session_state.df = df0
 
-    st.session_state.pool_full = build_item_pool(df0)
+    st.session_state.item_pool = build_item_pool(st.session_state.df)
+
+    st.session_state.order = list(range(len(st.session_state.item_pool)))
+    random.shuffle(st.session_state.order)
+    st.session_state.pos = 0
 
 df = st.session_state.df
 sep_used = st.session_state.sep_used
 source_label = st.session_state.source_label
-pool_full = st.session_state.pool_full
-
-total_batches = max(1, math.ceil(len(pool_full) / BATCH_SIZE))
-
-# =========================
-# BATCH (ORDERED)
-# =========================
-batch_num = get_query_int("batch", 1)
-batch_num = max(1, min(batch_num, total_batches))
-
-start = (batch_num - 1) * BATCH_SIZE
-end = min(start + BATCH_SIZE, len(pool_full))
-batch_slice = pool_full[start:end]
-
-if not batch_slice:
-    st.error("This batch is empty. Check your batch number.")
-    st.stop()
-
-# Shuffle ONLY inside this batch (stable until you reshuffle)
-batch_signature = f"{file_signature}::batch={batch_num}::k={BATCH_SIZE}"
-if st.session_state.get("batch_signature") != batch_signature:
-    st.session_state.batch_signature = batch_signature
-    st.session_state.order = list(range(len(batch_slice)))
-    random.shuffle(st.session_state.order)
-    st.session_state.pos = 0
-
-item_pool = [batch_slice[i] for i in st.session_state.order]
+item_pool = st.session_state.item_pool
 
 # Sidebar controls
-st.sidebar.subheader("Batch")
-st.sidebar.markdown(f"**Batch:** {batch_num} / {total_batches}")
-st.sidebar.markdown(f"**Items in this batch:** {len(item_pool)}")
-
 st.sidebar.subheader("Controls")
-if st.sidebar.button("Reshuffle order (this batch)"):
-    st.session_state.order = list(range(len(batch_slice)))
+if st.sidebar.button("Reshuffle order"):
+    st.session_state.order = list(range(len(item_pool)))
     random.shuffle(st.session_state.order)
     st.session_state.pos = 0
     st.rerun()
@@ -227,7 +161,7 @@ if st.sidebar.button("Reshuffle order (this batch)"):
 # MAIN UI
 # =========================
 st.title("Culture Rater")
-st.caption(" • ".join([source_label, f"Batch: {batch_num}/{total_batches}", f"Items: {len(item_pool)}", f"Rater: {rater_name}"]))
+st.caption(" • ".join([source_label, f"Items: {len(item_pool)}", f"Rater: {rater_name}"]))
 
 with st.expander("A/B/C/D meaning (confidence it is my country)", expanded=True):
     st.markdown("- **A** — Very sure: Unmistakably my country’s culture.")
@@ -239,7 +173,9 @@ if "pos" not in st.session_state:
     st.session_state.pos = 0
 clamp_pos(len(item_pool))
 
-item = item_pool[st.session_state.pos]
+idx_in_pool = st.session_state.order[st.session_state.pos]
+item = item_pool[idx_in_pool]
+
 row_id = item["row_id"]
 model_col = item["model_col"]
 text = item["text"]
@@ -261,8 +197,8 @@ st.markdown(
 )
 st.markdown("---")
 
-note_key = f"note_{batch_num}_{row_id}_{suf}"
-sel_key = f"selected_rating_{batch_num}_{row_id}_{suf}"
+note_key = f"note_{row_id}_{suf}"
+sel_key = f"selected_rating_{row_id}_{suf}"
 
 # init widgets once
 if note_key not in st.session_state:
@@ -313,18 +249,13 @@ with nav_cols[1]:
         st.rerun()
 
 # =========================
-# EXPORT (BATCH ONLY)
+# EXPORT
 # =========================
-st.subheader("Export updated CSV (this batch only)")
-
-# export only the rows used in this batch (keeps all columns, subset of rows)
-batch_row_ids = sorted({it["row_id"] for it in batch_slice})
-df_batch_rows = df.loc[batch_row_ids].copy()
-
-default_name = f"{uploaded_file.name.replace('.csv','')}_batch_{batch_num:02d}_rated_{rater_name.strip().replace(' ','_')}.csv"
+st.subheader("Export updated CSV")
+default_name = f"{uploaded_file.name.replace('.csv','')}_rated_{rater_name.strip().replace(' ','_')}.csv"
 export_name = st.text_input("Download filename", value=default_name)
 
-csv_bytes = df_batch_rows.to_csv(index=False, sep=sep_used, quoting=csv.QUOTE_MINIMAL).encode("utf-8")
+csv_bytes = st.session_state.df.to_csv(index=False, sep=sep_used, quoting=csv.QUOTE_MINIMAL).encode("utf-8")
 st.download_button(
     label="Download updated CSV",
     data=csv_bytes,
@@ -332,4 +263,4 @@ st.download_button(
     mime="text/csv",
 )
 
-st.info("Tip: At the end, download the updated CSV for THIS batch and upload it to the submission form.")
+st.info("Tip: At the end, download the updated CSV and send it back to Neda.")
