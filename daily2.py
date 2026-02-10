@@ -1,4 +1,15 @@
-# daily2.py — ORDERED BATCHES + SHUFFLE INSIDE EACH BATCH (keeps your original UI)
+# daily2.py — ORDERED BATCHES (40 items each) + SHUFFLE INSIDE EACH BATCH
+# Keeps your original UI (A/B/C/D explanation, Prev/Next(save&go), Export)
+#
+# How to open batch 1/2/3...
+#   https://YOURAPP.streamlit.app/?batch=1
+#   https://YOURAPP.streamlit.app/?batch=2
+#   ...
+#
+# Notes:
+# - Batch assignment is deterministic (by pool order): first 40 items = batch 1, next 40 = batch 2, etc.
+# - Display order is randomized ONLY inside the chosen batch (stable until you press "Reshuffle order").
+# - Export downloads ONLY the rows that appear in THIS batch (all columns preserved, subset of rows).
 
 import random
 import csv
@@ -18,12 +29,12 @@ MODEL_TEXT_COLS = [
 
 RATING_PREFIX = "confidence_rating_"
 NOTE_PREFIX = "rating_note_"
-DEFAULT_BATCH_SIZE = 40
+BATCH_SIZE = 40  # fixed as you requested
 
 
-# -------------------------
-# helpers
-# -------------------------
+# =========================
+# Helpers
+# =========================
 def clean_cell(x) -> str:
     if pd.isna(x):
         return ""
@@ -87,7 +98,6 @@ def ensure_model_columns_exist(df: pd.DataFrame):
         )
         st.stop()
 
-    # add rating + note columns per model
     for c in MODEL_TEXT_COLS:
         suf = slugify_col(c)
         rating_col = f"{RATING_PREFIX}{suf}"
@@ -101,10 +111,9 @@ def ensure_model_columns_exist(df: pd.DataFrame):
 
 def build_item_pool(df: pd.DataFrame):
     """
-    Pool is ordered deterministically:
-    - iterate model columns in MODEL_TEXT_COLS order
-    - within each model column, iterate rows top-to-bottom
-    So batch 1 really means the first 40 items in this fixed order.
+    Deterministic order:
+      MODEL_TEXT_COLS order, then row order (top-to-bottom).
+    So batch 1 = first 40 items in THIS fixed order.
     """
     pool = []
     for model_col in MODEL_TEXT_COLS:
@@ -131,12 +140,11 @@ def clamp_pos(n_items: int):
 
 
 def get_query_int(key: str, default: int) -> int:
-    """Read integer query param (supports streamlit list-or-str behavior)."""
     try:
-        v = st.query_params.get(key, default)
+        v = st.query_params.get(key, str(default))
         if isinstance(v, list):
-            v = v[0] if v else default
-        return int(v)
+            v = v[0] if v else str(default)
+        return int(str(v).strip())
     except Exception:
         return default
 
@@ -148,10 +156,6 @@ st.sidebar.title("Setup")
 rater_name = st.sidebar.text_input("Rater name (required)", value="")
 uploaded_file = st.sidebar.file_uploader("Upload your CSV", type=["csv"])
 
-# optional: keep batch size fixed at 40; if you want it editable, uncomment:
-# batch_size = st.sidebar.number_input("Items per batch", min_value=10, max_value=200, value=DEFAULT_BATCH_SIZE, step=10)
-batch_size = DEFAULT_BATCH_SIZE
-
 if not rater_name.strip():
     st.info("Enter your name in the sidebar to start.")
     st.stop()
@@ -161,7 +165,7 @@ if uploaded_file is None:
     st.stop()
 
 # =========================
-# LOAD ONCE PER FILE (persist df + pool)
+# LOAD ONCE PER FILE
 # =========================
 file_signature = f"{uploaded_file.name}-{uploaded_file.size}"
 
@@ -174,40 +178,38 @@ if st.session_state.get("file_signature") != file_signature:
     st.session_state.sep_used = sep0
     st.session_state.df = df0
 
-    # IMPORTANT: deterministic pool (no shuffle here)
-    st.session_state.item_pool_full = build_item_pool(df0)
+    st.session_state.pool_full = build_item_pool(df0)
 
 df = st.session_state.df
 sep_used = st.session_state.sep_used
 source_label = st.session_state.source_label
-pool_full = st.session_state.item_pool_full
+pool_full = st.session_state.pool_full
 
-total_batches = max(1, math.ceil(len(pool_full) / batch_size))
+total_batches = max(1, math.ceil(len(pool_full) / BATCH_SIZE))
 
 # =========================
-# BATCH SELECTION (ORDERED)
+# BATCH (ORDERED)
 # =========================
 batch_num = get_query_int("batch", 1)
 batch_num = max(1, min(batch_num, total_batches))
 
-start = (batch_num - 1) * batch_size
-end = min(start + batch_size, len(pool_full))
+start = (batch_num - 1) * BATCH_SIZE
+end = min(start + BATCH_SIZE, len(pool_full))
 batch_slice = pool_full[start:end]
 
 if not batch_slice:
     st.error("This batch is empty. Check your batch number.")
     st.stop()
 
-# SHUFFLE ONLY WITHIN THIS BATCH (and keep stable within session)
-batch_signature = f"{file_signature}::batch={batch_num}::k={batch_size}"
+# Shuffle ONLY inside this batch (stable until you reshuffle)
+batch_signature = f"{file_signature}::batch={batch_num}::k={BATCH_SIZE}"
 if st.session_state.get("batch_signature") != batch_signature:
     st.session_state.batch_signature = batch_signature
     st.session_state.order = list(range(len(batch_slice)))
     random.shuffle(st.session_state.order)
     st.session_state.pos = 0
 
-order = st.session_state.order
-item_pool = [batch_slice[i] for i in order]  # shuffled within batch
+item_pool = [batch_slice[i] for i in st.session_state.order]
 
 # Sidebar controls
 st.sidebar.subheader("Batch")
@@ -222,7 +224,7 @@ if st.sidebar.button("Reshuffle order (this batch)"):
     st.rerun()
 
 # =========================
-# MAIN UI (same as your original)
+# MAIN UI
 # =========================
 st.title("Culture Rater")
 st.caption(" • ".join([source_label, f"Batch: {batch_num}/{total_batches}", f"Items: {len(item_pool)}", f"Rater: {rater_name}"]))
@@ -281,7 +283,7 @@ st.radio(
 st.caption(f"Current selection (not saved yet): **{st.session_state[sel_key] or '-'}**")
 
 # =========================
-# NAV (same behavior as your original)
+# NAV
 # =========================
 nav_cols = st.columns(2)
 
