@@ -18,9 +18,7 @@ MODEL_TEXT_COLS = [
 RATING_PREFIX = "confidence_rating_"
 NOTE_PREFIX = "rating_note_"
 
-# --- batching ---
-BATCH_SIZE = 40  # items per batch (pool slice)
-
+ITEMS_PER_BATCH_DEFAULT = 40  # همون چیزی که الان داری
 
 def clean_cell(x) -> str:
     if pd.isna(x):
@@ -28,13 +26,11 @@ def clean_cell(x) -> str:
     s = str(x).strip()
     return "" if s.lower() == "nan" else s
 
-
 def slugify_col(col_name: str) -> str:
     s = "".join(ch if ch.isalnum() else "_" for ch in col_name.strip())
     while "__" in s:
-        s = s.replace("_", "")
+        s = s.replace("__", "_")
     return s.strip("_")
-
 
 def robust_read_csv(file_like):
     for sep in [",", ";", "\t", "|"]:
@@ -74,7 +70,6 @@ def robust_read_csv(file_like):
         st.error(f"Could not read CSV.\n\nError: {e}")
         st.stop()
 
-
 def ensure_model_columns_exist(df: pd.DataFrame):
     missing = [c for c in MODEL_TEXT_COLS if c not in df.columns]
     if missing:
@@ -95,19 +90,17 @@ def ensure_model_columns_exist(df: pd.DataFrame):
             df[note_col] = ""
     return df
 
-
 def build_item_pool(df: pd.DataFrame):
     pool = []
     for model_col in MODEL_TEXT_COLS:
         for row_id, val in df[model_col].items():
             t = clean_cell(val)
             if t:
-                pool.append({"row_id": int(row_id), "model_col": model_col, "text": t})
+                pool.append({"row_id": row_id, "model_col": model_col, "text": t})
     if not pool:
         st.error("No non-empty dialogs found across the specified model columns.")
         st.stop()
     return pool
-
 
 def write_rating_to_df(df: pd.DataFrame, row_id: int, model_col: str, rating: str, note: str):
     suf = slugify_col(model_col)
@@ -116,16 +109,25 @@ def write_rating_to_df(df: pd.DataFrame, row_id: int, model_col: str, rating: st
     df.at[row_id, rating_col] = clean_cell(rating)
     df.at[row_id, note_col] = clean_cell(note)
 
-
 def clamp_pos(n_items: int):
-    st.session_state.pos = max(0, min(st.session_state.pos, max(0, n_items - 1)))
+    if n_items <= 0:
+        st.session_state.pos = 0
+    else:
+        st.session_state.pos = max(0, min(st.session_state.pos, n_items - 1))
 
+def get_qp_int(key: str, default: int) -> int:
+    try:
+        v = st.query_params.get(key)
+        if v is None:
+            return default
+        if isinstance(v, list):
+            v = v[0]
+        return int(v)
+    except Exception:
+        return default
 
-def make_batch_order(batch_items_len: int):
-    order = list(range(batch_items_len))
-    random.shuffle(order)
-    return order
-
+def set_qp_int(key: str, value: int):
+    st.query_params[key] = str(int(value))
 
 # =========================
 # SIDEBAR
@@ -133,6 +135,15 @@ def make_batch_order(batch_items_len: int):
 st.sidebar.title("Setup")
 rater_name = st.sidebar.text_input("Rater name (required)", value="")
 uploaded_file = st.sidebar.file_uploader("Upload your CSV", type=["csv"])
+
+st.sidebar.divider()
+items_per_batch = st.sidebar.number_input(
+    "Items per batch",
+    min_value=10,
+    max_value=500,
+    value=ITEMS_PER_BATCH_DEFAULT,
+    step=10,
+)
 
 if not rater_name.strip():
     st.info("Enter your name in the sidebar to start.")
@@ -143,7 +154,7 @@ if uploaded_file is None:
     st.stop()
 
 # =========================
-# LOAD ONCE PER FILE (persist df + pool)
+# LOAD DF + POOL ONCE PER FILE
 # =========================
 file_signature = f"{uploaded_file.name}-{uploaded_file.size}"
 
@@ -155,92 +166,85 @@ if st.session_state.get("file_signature") != file_signature:
     st.session_state.source_label = f"Uploaded: {uploaded_file.name}"
     st.session_state.sep_used = sep0
     st.session_state.df = df0
-
     st.session_state.item_pool = build_item_pool(st.session_state.df)
-
-    # reset batch state for this file
-    st.session_state.batch_num = 1  # 1-indexed
-    st.session_state.pos = 0
-    st.session_state.batch_order = None  # created per batch
 
 df = st.session_state.df
 sep_used = st.session_state.sep_used
 source_label = st.session_state.source_label
-item_pool = st.session_state.item_pool
+pool = st.session_state.item_pool
 
-# =========================
-# BATCH SETUP
-# =========================
-n_total = len(item_pool)
-n_batches = max(1, math.ceil(n_total / BATCH_SIZE))
+total_batches = max(1, math.ceil(len(pool) / int(items_per_batch)))
 
-# sidebar batch selector (manual control)
+# batch from URL (persist across refresh)
+batch_from_url = get_qp_int("batch", 1)
+batch_from_url = max(1, min(batch_from_url, total_batches))
+
 st.sidebar.subheader("Batch")
-selected_batch = st.sidebar.number_input(
-    "Batch number",
-    min_value=1,
-    max_value=n_batches,
-    value=int(st.session_state.get("batch_num", 1)),
-    step=1,
+batch_num = st.sidebar.selectbox(
+    "Select batch",
+    options=list(range(1, total_batches + 1)),
+    index=batch_from_url - 1,
 )
 
-# if user changes batch manually, reset position + reshuffle for that batch
-if int(selected_batch) != int(st.session_state.get("batch_num", 1)):
-    st.session_state.batch_num = int(selected_batch)
+# keep URL in sync
+if batch_num != batch_from_url:
+    set_qp_int("batch", batch_num)
+    # reset position/order when batch changes
     st.session_state.pos = 0
-    st.session_state.batch_order = None
+    st.session_state.order = None
     st.rerun()
 
-batch_num = int(st.session_state.batch_num)
-batch_start = (batch_num - 1) * BATCH_SIZE
-batch_end = min(batch_start + BATCH_SIZE, n_total)
-batch_items = item_pool[batch_start:batch_end]
+# define slice for this batch
+start = (batch_num - 1) * int(items_per_batch)
+end = min(start + int(items_per_batch), len(pool))
+batch_items = pool[start:end]
 
-if len(batch_items) == 0:
-    st.error("This batch has no items (unexpected).")
+if not batch_items:
+    st.error("This batch is empty. Try a different batch number.")
     st.stop()
 
-# create shuffled order for this batch if not exists
-if st.session_state.get("batch_order") is None or len(st.session_state.batch_order) != len(batch_items):
-    st.session_state.batch_order = make_batch_order(len(batch_items))
+# init order/pos per (file + batch + batch_size)
+batch_signature = f"{file_signature}-batch{batch_num}-k{items_per_batch}"
+if st.session_state.get("batch_signature") != batch_signature:
+    st.session_state.batch_signature = batch_signature
+    st.session_state.order = list(range(len(batch_items)))
+    random.shuffle(st.session_state.order)
     st.session_state.pos = 0
 
-batch_order = st.session_state.batch_order
-
-# Sidebar controls
 st.sidebar.subheader("Controls")
 if st.sidebar.button("Reshuffle order (this batch)"):
-    st.session_state.batch_order = make_batch_order(len(batch_items))
+    st.session_state.order = list(range(len(batch_items)))
+    random.shuffle(st.session_state.order)
     st.session_state.pos = 0
     st.rerun()
+
+if st.sidebar.button("Next batch →"):
+    if batch_num < total_batches:
+        set_qp_int("batch", batch_num + 1)
+        st.session_state.pos = 0
+        st.session_state.order = None
+        st.rerun()
+    else:
+        st.sidebar.info("You are already on the last batch.")
 
 # =========================
 # MAIN UI
 # =========================
-st.title("Culture Rater (Batched)")
-st.caption(
-    " • ".join(
-        [
-            source_label,
-            f"Rater: {rater_name}",
-            f"Batch: {batch_num}/{n_batches}",
-            f"Items in this batch: {len(batch_items)}",
-            f"Batch slice: {batch_start}..{batch_end-1}",
-        ]
-    )
-)
+st.title("Culture Rater")
+st.caption(" • ".join([source_label, f"Total items: {len(pool)}", f"Rater: {rater_name}"]))
+st.info(f"Batch: **{batch_num} / {total_batches}** • Items in this batch: **{len(batch_items)}** (slice {start+1}-{end})")
 
-with st.expander("A/B/C/D meaning (confidence it is my country)", expanded=True):
-    st.markdown("- *A* — Very sure: Unmistakably my country’s culture.")
-    st.markdown("- *B* — Fairly sure: Mostly fits my country; a few details could fit elsewhere.")
-    st.markdown("- *C* — Not sure: Could be many countries; weak or generic cultural cues.")
-    st.markdown("- *D* — Sure it is NOT mine: Clearly mismatched; points elsewhere or feels wrong.")
+with st.expander("A/B/C/D meaning (confidence it is my country)", expanded=False):
+    st.markdown("- **A** — Very sure: Unmistakably my country’s culture.")
+    st.markdown("- **B** — Fairly sure: Mostly fits my country; a few details could fit elsewhere.")
+    st.markdown("- **C** — Not sure: Could be many countries; weak or generic cultural cues.")
+    st.markdown("- **D** — Sure it is NOT mine: Clearly mismatched; points elsewhere or feels wrong.")
 
 if "pos" not in st.session_state:
     st.session_state.pos = 0
 clamp_pos(len(batch_items))
 
-idx_in_batch = batch_order[st.session_state.pos]
+idx_in_batch = st.session_state.order[st.session_state.pos]
 item = batch_items[idx_in_batch]
 
 row_id = item["row_id"]
@@ -254,8 +258,8 @@ note_col = f"{NOTE_PREFIX}{suf}"
 existing_note = clean_cell(df.at[row_id, note_col])
 existing_rating = clean_cell(df.at[row_id, rating_col])
 
-st.write(f"Item {st.session_state.pos + 1} / {len(batch_items)} (Batch {batch_num}/{n_batches})")
-st.caption(f"Model column: *{model_col}*  •  Saved rating: *{existing_rating or '-'}*")
+st.write(f"Item {st.session_state.pos + 1} / {len(batch_items)} (Batch {batch_num}/{total_batches})")
+st.caption(f"Model column: **{model_col}**  •  Saved rating: **{existing_rating or '-'}**")
 
 st.markdown("---")
 st.markdown(
@@ -264,10 +268,9 @@ st.markdown(
 )
 st.markdown("---")
 
-note_key = f"note_{batch_num}{row_id}{suf}"
-sel_key = f"selected_rating_{batch_num}{row_id}{suf}"
+note_key = f"note_{batch_num}_{row_id}_{suf}"
+sel_key = f"selected_{batch_num}_{row_id}_{suf}"
 
-# init widgets once
 if note_key not in st.session_state:
     st.session_state[note_key] = existing_note
 if sel_key not in st.session_state:
@@ -283,12 +286,11 @@ st.radio(
     key=sel_key,
     horizontal=True,
 )
-st.caption(f"Current selection (not saved yet): *{st.session_state[sel_key] or '-'}*")
 
 # =========================
 # NAV
 # =========================
-nav_cols = st.columns(3)
+nav_cols = st.columns(2)
 
 with nav_cols[0]:
     if st.button("Prev", use_container_width=True):
@@ -315,36 +317,11 @@ with nav_cols[1]:
         clamp_pos(len(batch_items))
         st.rerun()
 
-with nav_cols[2]:
-    # finish batch -> go next batch
-    if st.button("Finish batch (save & next batch)", use_container_width=True):
-        # optional: force-save current item if selected
-        if st.session_state[sel_key]:
-            write_rating_to_df(
-                st.session_state.df,
-                row_id,
-                model_col,
-                st.session_state[sel_key],
-                st.session_state[note_key],
-            )
-
-        if batch_num < n_batches:
-            st.session_state.batch_num = batch_num + 1
-            st.session_state.pos = 0
-            st.session_state.batch_order = None
-            st.rerun()
-        else:
-            st.success("All batches finished.")
-            st.stop()
-
 # =========================
 # EXPORT
 # =========================
 st.subheader("Export updated CSV (this batch only)")
-
-base = uploaded_file.name.replace(".csv", "")
-safe_rater = rater_name.strip().replace(" ", "_")
-default_name = f"{base}batch{batch_num:02d}rated{safe_rater}.csv"
+default_name = f"{uploaded_file.name.replace('.csv','')}_batch_{batch_num:02d}_rated_{rater_name.strip().replace(' ','_')}.csv"
 export_name = st.text_input("Download filename", value=default_name)
 
 csv_bytes = st.session_state.df.to_csv(index=False, sep=sep_used, quoting=csv.QUOTE_MINIMAL).encode("utf-8")
@@ -355,4 +332,4 @@ st.download_button(
     mime="text/csv",
 )
 
-st.info("Tip: After finishing this batch, download the updated CSV and upload it using the submission form.")
+st.caption("After finishing this batch, download the CSV and upload it using your submission form.")
